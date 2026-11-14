@@ -1,0 +1,9 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - run: make CFLAGS="-O2 -fsanitize=address,undefined -g" LDFLAGS="-fsanitize=address,undefined" test

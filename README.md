@@ -1,0 +1,64 @@
+# zapret2-probe
+
+`zprobe`: small C tool for checking whether a site is reachable over TLS, QUIC, HTTP and DNS, and *how* it fails
+(RST, timeout, TLS alert, forged answer). JSON output. No curl, no OpenSSL. Part of the
+[zapret2-openwrt](../zapret2-openwrt/PLAN.md) strategy search, but builds and runs on any Linux.
+
+```
+zprobe tls  --host example.com [--ip 1.2.3.4] [--mark 0x08010000] [--repeat 5] [--template FILE]
+zprobe quic --host example.com
+zprobe http --host example.com [--path /]
+zprobe dns  --host example.com [--server 1.1.1.1] [--ref 8.8.8.8] [--wait 300]
+zprobe batch [--parallel 4] [--pace-ms 200] < jobs.jsonl
+zprobe hello --host example.com > clienthello.bin
+```
+
+Exit status: 0 if every probe was `ok`, 1 otherwise, 2 for usage errors.
+
+## Output
+
+```json
+{"proto":"tls","host":"example.com","ip":"104.20.23.154","port":443,"repeat":2,"ok":2,"class":"ok",
+ "counts":{"ok":2},"median_ms":53,"results":[{"class":"ok","ms":52,"connect_ms":19,"detail":"server_hello"}, ...]}
+```
+
+Classes: `ok`, `rst`, `timeout`, `alert`, `forged`, `dns_spoofed`, `unreachable`, `error`.
+The top-level `class` is `ok` only if all repeats are ok, else the most frequent failure.
+
+| Probe | ok | other classes |
+|---|---|---|
+| tls | ServerHello record | `alert` (TLS alert), `forged` (HTTP text, garbage, wrong version, non-ServerHello), `rst` (RST/FIN before data or while sending), `timeout`, `unreachable` (connect failed) |
+| quic | server Initial decrypts (ServerHello or ACK), Retry, or Version Negotiation | `forged` (undecryptable reply), `timeout`, `unreachable` (ICMP) |
+| http | valid response | `forged` for 451, redirect to a different registrable domain, non-HTTP data |
+| dns | answer received | `dns_spoofed` (two different replies to one query, or a private/bogon address), `timeout`, `error` (rcode) |
+
+`--ref` adds `differs_from_ref` to the detail when the answers don't overlap. That's only a hint, because CDNs differ by resolver.
+
+## Batch
+
+One JSON object per line in, one result per line out. Fields: `id` (echoed), `cmd` (default `tls`), `host`, `ip`, `port`,
+`mark`, `repeat`, `timeout`, `pace_ms`, `path`, `server`, `ref`, `template`, `family`. With `--parallel N` each job runs in a
+forked worker, so output order is completion order; use `id`.
+
+## Isolation marks
+
+`--mark` sets `SO_MARK` on every socket (including the DNS ones), so nft rules can route probe traffic to a separate
+nfqws2 instance. It needs `CAP_NET_ADMIN`; without it the probe reports `error: socket_Operation not permitted`.
+
+## Build and test
+
+```
+git clone --recurse-submodules <this repo>
+make            # build/zprobe
+make test       # unit tests (RFC 9001 key vectors, classification, parsing) + loopback tests with fake servers
+```
+
+Crypto for QUIC (AES-GCM, HKDF) comes from the pinned `upstream/zapret2` submodule (`nfq2/crypto`), not a copy.
+
+## Not done yet
+
+- `zprobe fetch` (full TLS via wolfssl, "16 KB" blocks) and DoH for `dns`.
+- Cert-mismatch / TTL-based detection of forged TLS answers (needs a full handshake or IP_RECVTTL on raw sockets).
+- `batch` uses forked workers, not a single epoll loop.
+- The built-in ClientHello has a fixed extension order (Chrome shuffles it); use `--template` with a capture to match a specific client.
+- No netns integration test yet: `make test` covers loopback only.

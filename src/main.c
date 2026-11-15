@@ -20,6 +20,7 @@ static void usage(FILE *f)
 	      "  --ip ADDR          connect here instead of resolving --host\n"
 	      "  --port N           default 443 (tls, quic), 80 (http)\n"
 	      "  --mark 0xHEX       SO_MARK for every socket (needs CAP_NET_ADMIN)\n"
+	      "  --user NAME        drop root to NAME after startup; keeps only CAP_NET_ADMIN, and only if --mark/marks are used\n"
 	      "  --timeout MS       per probe, default 5000\n"
 	      "  --repeat N         probes per job, default 1\n"
 	      "  --pace-ms MS       pause between repeats\n"
@@ -199,12 +200,13 @@ int main(int argc, char **argv)
 {
 	probe_opts o;
 	int parallel = 1;
+	const char *user = NULL;
 	static const struct option lo[] = {
 		{ "host", 1, 0, 'H' }, { "ip", 1, 0, 'i' }, { "port", 1, 0, 'p' }, { "mark", 1, 0, 'm' },
 		{ "timeout", 1, 0, 't' }, { "repeat", 1, 0, 'r' }, { "pace-ms", 1, 0, 'P' },
 		{ "template", 1, 0, 'T' }, { "path", 1, 0, 'a' }, { "server", 1, 0, 's' }, { "ref", 1, 0, 'R' },
 		{ "wait", 1, 0, 'w' }, { "parallel", 1, 0, 'j' }, { "json", 0, 0, 'J' }, { "help", 0, 0, 'h' },
-		{ "version", 0, 0, 'V' }, { 0 }
+		{ "version", 0, 0, 'V' }, { "user", 1, 0, 'u' }, { 0 }
 	};
 	opts_default(&o);
 	signal(SIGPIPE, SIG_IGN);
@@ -231,6 +233,7 @@ int main(int argc, char **argv)
 		case 'j': parallel = atoi(optarg) < 1 ? 1 : atoi(optarg); break;
 		case '4': o.family = 4; break;
 		case '6': o.family = 6; break;
+		case 'u': user = optarg; break;
 		case 'J': break;
 		case 'h': usage(stdout); return 0;
 		case 'V': puts("zprobe " VERSION); return 0;
@@ -238,6 +241,8 @@ int main(int argc, char **argv)
 		}
 	}
 	if (o.timeout_ms < 1) o.timeout_ms = 5000;
+	/* batch jobs may carry their own marks, so keep CAP_NET_ADMIN there */
+	if (user && priv_drop(user, o.mark || !strcmp(cmd, "batch"))) return 2;
 	if (!strcmp(cmd, "batch")) return cmd_batch(&o, parallel, o.pace_ms);
 	if (!strcmp(cmd, "hello")) return cmd_hello(&o);
 	if (strcmp(cmd, "tls") && strcmp(cmd, "quic") && strcmp(cmd, "http") && strcmp(cmd, "dns")) {

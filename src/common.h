@@ -37,6 +37,7 @@ typedef struct {
 
 /* net.c */
 int64_t now_ms(void);
+int priv_drop(const char *user, int keep_net_admin);
 int net_resolve(const char *host, const char *ip, int family, int port, int socktype,
 		struct sockaddr_storage *ss, socklen_t *sl);
 int net_socket(int family, int type, uint32_t mark);

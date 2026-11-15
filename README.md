@@ -5,7 +5,7 @@
 [zapret2-openwrt](../zapret2-openwrt/PLAN.md) strategy search, but builds and runs on any Linux.
 
 ```
-zprobe tls  --host example.com [--ip 1.2.3.4] [--mark 0x08010000] [--repeat 5] [--template FILE]
+zprobe tls  --host example.com [--ip 1.2.3.4] [--mark 0x08000001] [--repeat 5] [--template FILE]
 zprobe quic --host example.com
 zprobe http --host example.com [--path /]
 zprobe dns  --host example.com [--server 1.1.1.1] [--ref 8.8.8.8] [--wait 300]
@@ -39,6 +39,10 @@ The top-level `class` is `ok` only if all repeats are ok, else the most frequent
 One JSON object per line in, one result per line out. Fields: `id` (echoed), `cmd` (default `tls`), `host`, `ip`, `port`,
 `mark`, `repeat`, `timeout`, `pace_ms`, `path`, `server`, `ref`, `template`, `family`. With `--parallel N` each job runs in a
 forked worker, so output order is completion order; use `id`.
+
+## Privileges
+
+`--user NAME` drops root after startup. Only `CAP_NET_ADMIN` is kept (for `SO_MARK`), and only if `--mark` is given or the command is `batch`. It refuses `root` and fails if not run as root.
 
 ## Isolation marks
 

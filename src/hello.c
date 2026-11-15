@@ -5,6 +5,10 @@
 #include <unistd.h>
 #include "common.h"
 
+#ifndef TEMPLATE_DIR
+#define TEMPLATE_DIR "/usr/share/zapret2/probe/templates"
+#endif
+
 void rand_bytes(void *p, size_t n)
 {
 	int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
@@ -287,7 +291,15 @@ size_t hello_load(const probe_opts *o, uint8_t *out, size_t cap)
 	if (!o->template_path || !strcmp(o->template_path, "builtin") || !strcmp(o->template_path, "chrome"))
 		return hello_build_tcp(out, cap, o->host);
 	uint8_t tpl[4096];
-	FILE *f = fopen(o->template_path, "rb");
+	char path[512];
+	FILE *f = NULL;
+	/* a bare name (no '/') is looked up as <dir>/<name>.bin; dir is $ZPROBE_TEMPLATES or the install dir */
+	if (!strchr(o->template_path, '/')) {
+		const char *dir = getenv("ZPROBE_TEMPLATES");
+		snprintf(path, sizeof path, "%s/%s.bin", dir ? dir : TEMPLATE_DIR, o->template_path);
+		f = fopen(path, "rb");
+	}
+	if (!f) f = fopen(o->template_path, "rb");
 	if (!f) return 0;
 	size_t n = fread(tpl, 1, sizeof tpl, f);
 	fclose(f);

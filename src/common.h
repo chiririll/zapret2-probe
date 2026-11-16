@@ -5,7 +5,7 @@
 #include <sys/socket.h>
 
 typedef enum {
-	RC_OK, RC_RST, RC_TIMEOUT, RC_ALERT, RC_FORGED, RC_DNS_SPOOFED, RC_UNREACHABLE, RC_ERROR, RC_COUNT
+	RC_OK, RC_RST, RC_TIMEOUT, RC_ALERT, RC_FORGED, RC_DNS_SPOOFED, RC_UNREACHABLE, RC_ERROR, RC_STALLED, RC_COUNT
 } result_class;
 
 const char *class_name(result_class c);
@@ -24,6 +24,8 @@ typedef struct {
 	const char *server;    /* dns */
 	const char *ref;       /* dns reference resolver */
 	int dns_wait_ms;
+	int min_bytes;         /* fetch: stop when this many bytes came back on the connection */
+	const char *ca;        /* fetch: CA bundle file, default /etc/ssl/certs/ca-certificates.crt */
 } probe_opts;
 
 typedef struct {
@@ -31,6 +33,8 @@ typedef struct {
 	int ms;                /* send -> verdict */
 	int connect_ms;
 	int status;            /* http status */
+	int bytes;             /* fetch: bytes received on the TCP connection, handshake included */
+	int hs_ms;             /* fetch: TLS handshake time */
 	char detail[48];
 	char info[256];        /* dns answers, space separated */
 } presult;
@@ -42,6 +46,8 @@ int net_resolve(const char *host, const char *ip, int family, int port, int sock
 		struct sockaddr_storage *ss, socklen_t *sl);
 int net_socket(int family, int type, uint32_t mark);
 int net_connect(int fd, const struct sockaddr_storage *ss, socklen_t sl, int timeout_ms);
+int net_wait(int fd, short events, int64_t deadline);   /* 0 ready, -1 errno (ETIMEDOUT) */
+void net_conn_fail(presult *r, int e);
 int net_write_all(int fd, const void *buf, size_t len, int64_t deadline);
 /* >0 bytes, 0 eof, -1 error (errno; ETIMEDOUT on deadline) */
 ssize_t net_read(int fd, void *buf, size_t len, int64_t deadline);
@@ -80,6 +86,8 @@ void probe_tls(const probe_opts *o, const struct sockaddr_storage *ss, socklen_t
 void probe_quic(const probe_opts *o, const struct sockaddr_storage *ss, socklen_t sl, presult *r);
 void probe_http(const probe_opts *o, const struct sockaddr_storage *ss, socklen_t sl, presult *r);
 void probe_dns(const probe_opts *o, presult *r);
+/* fetch.c: full TLS + HTTP download, needs mbedtls (WITH_MBEDTLS=1); otherwise reports error/no_mbedtls */
+void probe_fetch(const probe_opts *o, const struct sockaddr_storage *ss, socklen_t sl, presult *r);
 
 /* dns.c helpers (tested) */
 size_t dns_build_query(uint8_t *out, size_t cap, uint16_t id, const char *name, uint16_t type);

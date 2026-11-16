@@ -4,7 +4,7 @@
 #include <unistd.h>
 #include "common.h"
 
-static void conn_fail(presult *r, int e)
+void net_conn_fail(presult *r, int e)
 {
 	r->cls = e == ECONNRESET ? RC_RST : RC_UNREACHABLE;
 	set_detail(r, "connect_%s", e == ETIMEDOUT ? "timeout" : e == ECONNREFUSED ? "refused" :
@@ -23,7 +23,7 @@ static void tcp_exchange(const probe_opts *o, const struct sockaddr_storage *ss,
 	int64_t t0 = now_ms();
 	int e = net_connect(fd, ss, sl, o->timeout_ms);
 	r->connect_ms = (int)(now_ms() - t0);
-	if (e) { conn_fail(r, e); close(fd); return; }
+	if (e) { net_conn_fail(r, e); close(fd); return; }
 	int64_t t1 = now_ms(), dl = t1 + o->timeout_ms;
 	if (net_write_all(fd, req, rl, dl) < 0) {
 		r->cls = (errno == ECONNRESET || errno == EPIPE) ? RC_RST : RC_TIMEOUT;
@@ -93,7 +93,7 @@ void probe_quic(const probe_opts *o, const struct sockaddr_storage *ss, socklen_
 	if (!pl) { r->cls = RC_ERROR; set_detail(r, "initial_build"); return; }
 	int fd = net_socket(ss->ss_family, SOCK_DGRAM, o->mark);
 	if (fd < 0) { r->cls = RC_ERROR; set_detail(r, "socket_%s", strerror(errno)); return; }
-	if (connect(fd, (const struct sockaddr *)ss, sl) < 0) { conn_fail(r, errno); close(fd); return; }
+	if (connect(fd, (const struct sockaddr *)ss, sl) < 0) { net_conn_fail(r, errno); close(fd); return; }
 	int64_t t1 = now_ms(), dl = t1 + o->timeout_ms;
 	if (send(fd, pkt, pl, 0) < 0 || (pl2 && send(fd, pkt2, pl2, 0) < 0)) {
 		r->cls = errno == ECONNREFUSED ? RC_UNREACHABLE : RC_ERROR;

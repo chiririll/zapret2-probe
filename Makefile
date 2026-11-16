@@ -6,13 +6,21 @@ override CFLAGS  += -std=gnu99 -Wall -Wextra -Wno-unused-parameter -Wno-array-pa
 UPSTREAM ?= upstream/zapret2/nfq2
 CRYPTO_SRC = $(addprefix $(UPSTREAM)/crypto/,aes.c gcm.c aes-gcm.c hkdf.c hmac.c usha.c sha224-256.c)
 override CPPFLAGS += -I$(UPSTREAM)/crypto -Isrc
-SRC     = src/main.c src/net.c src/json.c src/hello.c src/classify.c src/quic.c src/probe_tls.c src/dns.c src/priv.c
+# fetch needs mbedtls: make WITH_MBEDTLS=1 [MBEDTLS_PREFIX=/path]. Without it everything else still builds with no dependencies.
+WITH_MBEDTLS ?= 0
+MBEDTLS_LIBDIR ?= $(MBEDTLS_PREFIX)/lib
+SRC     = src/fetch.c src/main.c src/net.c src/json.c src/hello.c src/classify.c src/quic.c src/probe_tls.c src/dns.c src/priv.c
 BUILD   ?= build
 OBJ     = $(patsubst %.c,$(BUILD)/%.o,$(SRC) $(CRYPTO_SRC))
 LIBOBJ  = $(filter-out $(BUILD)/src/main.o,$(OBJ))
 PREFIX  ?= /usr
 DESTDIR ?=
 SHAREDIR ?= $(PREFIX)/share/zapret2/probe
+ifeq ($(WITH_MBEDTLS),1)
+override CPPFLAGS += -DWITH_MBEDTLS $(if $(MBEDTLS_PREFIX),-I$(MBEDTLS_PREFIX)/include)
+override LDLIBS += $(if $(MBEDTLS_PREFIX),-L$(MBEDTLS_LIBDIR) )-lmbedtls -lmbedx509 -lmbedcrypto
+TESTS_FETCH = $(BUILD)/tests/test_fetch
+endif
 override CPPFLAGS += -DTEMPLATE_DIR='"$(SHAREDIR)/templates"'
 
 all: $(BUILD)/zprobe
@@ -28,9 +36,10 @@ $(BUILD)/tests/%: tests/%.c $(LIBOBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-test: all $(BUILD)/tests/test_unit $(BUILD)/tests/test_local
+test: all $(BUILD)/tests/test_unit $(BUILD)/tests/test_local $(TESTS_FETCH)
 	$(BUILD)/tests/test_unit
 	$(BUILD)/tests/test_local
+	$(if $(TESTS_FETCH),$(TESTS_FETCH))
 
 install: $(BUILD)/zprobe
 	install -D -m 0755 $(BUILD)/zprobe $(DESTDIR)$(PREFIX)/bin/zprobe

@@ -13,7 +13,7 @@
 #include "common.h"
 
 static const char *const names[RC_COUNT] = {
-	"ok", "rst", "timeout", "alert", "forged", "dns_spoofed", "unreachable", "error"
+	"ok", "rst", "timeout", "alert", "forged", "dns_spoofed", "unreachable", "error", "stalled"
 };
 const char *class_name(result_class c) { return c < RC_COUNT ? names[c] : "error"; }
 
@@ -74,6 +74,8 @@ static int wait_fd(int fd, short ev, int64_t deadline)
 		if (errno != EINTR) return -1;
 	}
 }
+
+int net_wait(int fd, short events, int64_t deadline) { return wait_fd(fd, events, deadline); }
 
 int net_connect(int fd, const struct sockaddr_storage *ss, socklen_t sl, int timeout_ms)
 {

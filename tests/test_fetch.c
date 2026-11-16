@@ -36,7 +36,7 @@ static const char KEY_PEM[] =
 	"-----END PRIVATE KEY-----\n";
 
 /* what the server does once the TLS handshake is done */
-enum { SRV_BIG, SRV_STALL_AT, SRV_SMALL_CLOSE, SRV_SMALL_KEEPALIVE, SRV_CHUNKED_KEEPALIVE, SRV_HS_RST, SRV_SILENT };
+enum { SRV_BIG, SRV_STALL_AT, SRV_SMALL_CLOSE, SRV_SMALL_KEEPALIVE, SRV_CHUNKED_KEEPALIVE, SRV_HS_RST, SRV_SILENT, SRV_DUMP_PLAIN, SRV_DUMP_CHUNKED };
 
 static int sock_send(void *c, const unsigned char *b, size_t l) { ssize_t n = send(*(int *)c, b, l, MSG_NOSIGNAL); return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : (int)n; }
 static int sock_recv(void *c, unsigned char *b, size_t l) { ssize_t n = recv(*(int *)c, b, l, 0); return n < 0 ? MBEDTLS_ERR_NET_RECV_FAILED : (int)n; }
@@ -103,6 +103,19 @@ static void server(int ls, int mode)
 			srv_body(&ssl, 3000, 0);
 		}
 		break;
+	case SRV_DUMP_PLAIN: {
+		static const char m[] = "HTTP/1.1 200 OK\r\nContent-Security-Policy: img-src cdn.example.net\r\nContent-Length: 30\r\n\r\n<a href=\"//a.example.org/x\">";
+		k = mbedtls_ssl_read(&ssl, (unsigned char *)req, sizeof req); (void)k;
+		srv_write(&ssl, m, sizeof m - 1);
+		sleep(5);
+		break;
+	}
+	case SRV_DUMP_CHUNKED: {
+		static const char m[] = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+		k = mbedtls_ssl_read(&ssl, (unsigned char *)req, sizeof req); (void)k;
+		srv_write(&ssl, m, sizeof m - 1);
+		break;
+	}
 	case SRV_CHUNKED_KEEPALIVE:
 		for (;;) {
 			k = mbedtls_ssl_read(&ssl, (unsigned char *)req, sizeof req);
@@ -133,6 +146,16 @@ static pid_t spawn(int mode, int *port)
 	if (p == 0) server(ls, mode);
 	close(ls);
 	return p;
+}
+
+static void run_dump(int mode, int dump, presult *r, const char *ca)
+{
+	int port;
+	pid_t p = spawn(mode, &port);
+	struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+	probe_opts o = { .host = "localhost", .timeout_ms = 2000, .repeat = 1, .min_bytes = 65536, .ca = ca, .dump = dump };
+	probe_fetch(&o, (struct sockaddr_storage *)&a, sizeof a, r);
+	kill(p, SIGKILL); waitpid(p, NULL, 0);
 }
 
 static void run(int mode, const char *host, int min_bytes, int timeout, const char *ca, presult *r)
@@ -189,6 +212,15 @@ int main(void)
 	CHECK(r.cls == RC_RST && !strncmp(r.detail, "hs_", 3));
 	run(SRV_SILENT, "localhost", 65536, 400, ca, &r);
 	CHECK(r.cls == RC_TIMEOUT && !strcmp(r.detail, "hs_no_reply"));
+
+	/* --dump: headers and decoded body of the first response */
+	run_dump(SRV_DUMP_CHUNKED, 1000, &r, ca);
+	CHECK(r.cls == RC_OK && r.dump && strstr(r.dump, "\r\n\r\nhello world") && !strstr(r.dump, "5\r\nhello"));
+	free(r.dump);
+	run_dump(SRV_DUMP_PLAIN, 10, &r, ca);      /* body cut at 10 bytes, headers whole */
+	CHECK(r.cls == RC_OK && r.dump && strstr(r.dump, "Content-Security-Policy: img-src cdn.example.net") && strstr(r.dump, "<a href=\""));
+	CHECK(r.dump && !strstr(r.dump, "a.example.org"));
+	free(r.dump);
 
 	unlink(ca);
 	DONE();

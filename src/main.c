@@ -27,6 +27,7 @@ static void usage(FILE *f)
 	      "  --template NAME|FILE   tls: ClientHello template (builtin or a captured record file)\n"
 	      "  --path P           http, fetch: request path, default /\n"
 	      "  --min-bytes N      fetch: ok once N bytes came back on the connection (handshake included), default 65536\n"
+	      "  --dump N           fetch: also return the response headers and up to N bytes of the body (first response only)\n"
 	      "  --ca FILE          fetch: CA bundle, default /etc/ssl/certs/ca-certificates.crt\n"
 	      "  --server IP        dns: resolver (default: first in /etc/resolv.conf)\n"
 	      "  --ref IP           dns: second resolver for comparison\n"
@@ -111,6 +112,7 @@ static int run_job(const char *cmd, const probe_opts *o, const char *id, sbuf *o
 		if (!dns) sb_printf(out, ",\"connect_ms\":%d", res[i].connect_ms);
 		if (res[i].status) sb_printf(out, ",\"status\":%d", res[i].status);
 		if (fetch) sb_printf(out, ",\"bytes\":%d,\"hs_ms\":%d", res[i].bytes, res[i].hs_ms);
+		if (fetch && res[i].dump) { sb_puts(out, ",\"dump\":"); sb_jstr(out, res[i].dump); }
 		if (res[i].detail[0]) { sb_puts(out, ",\"detail\":"); sb_jstr(out, res[i].detail); }
 		if (dns && res[i].info[0]) {
 			sb_puts(out, ",\"answers\":[");
@@ -127,6 +129,7 @@ static int run_job(const char *cmd, const probe_opts *o, const char *id, sbuf *o
 		sb_puts(out, "}");
 	}
 	sb_puts(out, "]}");
+	for (int i = 0; i < rep; i++) free(res[i].dump);
 	free(res); free(ms);
 	return bad;
 }
@@ -164,7 +167,7 @@ static int cmd_batch(const probe_opts *base, int parallel, int pace_ms)
 		STR("host", host, host); STR("ip", ip, ip); STR("path", path, path);
 		STR("server", server, server); STR("ref", ref, ref); STR("template", tpl, template_path); STR("ca", ca, ca);
 		NUM("port", port); NUM("timeout", timeout_ms); NUM("repeat", repeat); NUM("family", family);
-		NUM("pace_ms", pace_ms); NUM("min_bytes", min_bytes);
+		NUM("pace_ms", pace_ms); NUM("min_bytes", min_bytes); NUM("dump", dump);
 		if ((v = kv_get(a, n, "mark"))) o.mark = parse_mark(v);
 		snprintf(cmd, sizeof cmd, "%s", (v = kv_get(a, n, "cmd")) ? v : "tls");
 		snprintf(id, sizeof id, "%s", (v = kv_get(a, n, "id")) ? v : "");
@@ -211,7 +214,7 @@ int main(int argc, char **argv)
 		{ "timeout", 1, 0, 't' }, { "repeat", 1, 0, 'r' }, { "pace-ms", 1, 0, 'P' },
 		{ "template", 1, 0, 'T' }, { "path", 1, 0, 'a' }, { "server", 1, 0, 's' }, { "ref", 1, 0, 'R' },
 		{ "wait", 1, 0, 'w' }, { "parallel", 1, 0, 'j' }, { "json", 0, 0, 'J' }, { "help", 0, 0, 'h' },
-		{ "version", 0, 0, 'V' }, { "user", 1, 0, 'u' }, { "min-bytes", 1, 0, 'b' }, { "ca", 1, 0, 'c' }, { 0 }
+		{ "version", 0, 0, 'V' }, { "user", 1, 0, 'u' }, { "min-bytes", 1, 0, 'b' }, { "ca", 1, 0, 'c' }, { "dump", 1, 0, 'd' }, { 0 }
 	};
 	opts_default(&o);
 	signal(SIGPIPE, SIG_IGN);
@@ -241,6 +244,7 @@ int main(int argc, char **argv)
 		case 'u': user = optarg; break;
 		case 'b': o.min_bytes = atoi(optarg); break;
 		case 'c': o.ca = optarg; break;
+		case 'd': o.dump = atoi(optarg); break;
 		case 'J': break;
 		case 'h': usage(stdout); return 0;
 		case 'V': puts("zprobe " VERSION); return 0;

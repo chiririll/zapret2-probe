@@ -146,6 +146,73 @@ static bool resp_feed(resp_t *p, const uint8_t *b, size_t n)
 	return p->clen >= 0 && p->body >= p->clen;
 }
 
+/* --dump: the headers and the (de-chunked) body of the first response, for the controller to read.
+ * Bytes above 0x7e become '?', so the result is plain ASCII and always valid JSON text. */
+typedef struct {
+	char *p;
+	size_t len, cap, body, max;
+	bool hdone, chunked, done;
+	int cs;                  /* chunk state: 0 size line, 1 data, 2 CR LF after data, 3 trailer/end */
+	size_t left;
+	char line[24];
+	size_t ll;
+} dump_t;
+
+static void dump_put(dump_t *d, unsigned char c)
+{
+	if (d->len + 2 > d->cap) {
+		size_t nc = d->cap ? d->cap * 2 : 4096;
+		char *np = realloc(d->p, nc);
+		if (!np) { d->done = true; return; }
+		d->p = np; d->cap = nc;
+	}
+	d->p[d->len++] = c >= 0x20 && c < 0x7f ? c : (c == '\n' || c == '\r' || c == '\t' ? c : '?');
+	d->p[d->len] = 0;
+}
+
+static void dump_feed(dump_t *d, const uint8_t *b, size_t n)
+{
+	for (size_t i = 0; i < n && !d->done; i++) {
+		if (!d->hdone) {
+			dump_put(d, b[i]);
+			if (d->len >= 4 && !memcmp(d->p + d->len - 4, "\r\n\r\n", 4)) {
+				d->hdone = true;
+				d->chunked = false;
+				for (char *l = d->p; l && *l; ) {
+					if (!strncasecmp(l, "transfer-encoding:", 18) && strcasestr(l, "chunked") &&
+					    strcasestr(l, "chunked") < strstr(l, "\r\n")) d->chunked = true;
+					l = strstr(l, "\r\n");
+					if (l) l += 2;
+				}
+			}
+			continue;
+		}
+		if (!d->chunked) {
+			if (d->body >= d->max) { d->done = true; break; }
+			dump_put(d, b[i]); d->body++;
+			continue;
+		}
+		switch (d->cs) {
+		case 0:
+			if (b[i] == '\n') {
+				d->line[d->ll] = 0;
+				d->left = strtoul(d->line, NULL, 16);
+				d->ll = 0;
+				if (d->left == 0) { d->cs = 3; d->done = true; } else d->cs = 1;
+			} else if (d->ll + 1 < sizeof d->line) d->line[d->ll++] = b[i];
+			break;
+		case 1:
+			if (d->body >= d->max) { d->done = true; break; }
+			dump_put(d, b[i]); d->body++;
+			if (--d->left == 0) d->cs = 2;
+			break;
+		case 2:
+			if (b[i] == '\n') d->cs = 0;
+			break;
+		}
+	}
+}
+
 static int tls_fail_class(int ret, const bio_t *b, presult *r, const char *phase)
 {
 	if (ret == MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE) { r->cls = RC_ALERT; set_detail(r, "%s_alert", phase); }
@@ -235,6 +302,7 @@ void probe_fetch(const probe_opts *o, const struct sockaddr_storage *ss, socklen
 	resp_t resp;
 	resp_reset(&resp);
 	int nreq = 1;
+	dump_t dmp = { .max = o->dump > 0 ? (size_t)o->dump : 0 };
 	if ((ret = write_all(&ssl, &b, req, rl, t1 + o->timeout_ms)) != 0) {
 		if (ret == MBEDTLS_ERR_SSL_TIMEOUT) { r->cls = RC_STALLED; set_detail(r, "send_stall"); }
 		else tls_fail_class(ret, &b, r, "send");
@@ -244,12 +312,17 @@ void probe_fetch(const probe_opts *o, const struct sockaddr_storage *ss, socklen
 	uint8_t buf[IO_CHUNK];
 	dl = now_ms() + o->timeout_ms;        /* inactivity limit, moved on every byte */
 	for (;;) {
-		if ((int64_t)b.rx >= min_bytes) { r->cls = RC_OK; set_detail(r, "bytes_%d", (int)b.rx); break; }
+		if (!dmp.max && (int64_t)b.rx >= min_bytes) { r->cls = RC_OK; set_detail(r, "bytes_%d", (int)b.rx); break; }
 		ret = mbedtls_ssl_read(&ssl, buf, sizeof buf);
 		if (ret > 0) {
 			dl = now_ms() + o->timeout_ms;
 			bool done = resp_feed(&resp, buf, ret);
 			if (resp.status && !r->status) r->status = resp.status;
+			if (dmp.max && nreq == 1) {
+				dump_feed(&dmp, buf, ret);
+				if (done || dmp.done) { r->cls = RC_OK; set_detail(r, "dump_%zu", dmp.len); break; }
+				continue;
+			}
 			if (done && (int64_t)b.rx < min_bytes) {
 				if (nreq >= MAX_REQUESTS) { r->cls = RC_OK; set_detail(r, "short_%d", (int)b.rx); break; }
 				resp_reset(&resp);
@@ -269,6 +342,7 @@ void probe_fetch(const probe_opts *o, const struct sockaddr_storage *ss, socklen
 		if (ret == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) continue;
 		if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
 			/* the server finished first: the page was smaller than min-bytes, inconclusive for the controller */
+			if (dmp.max && dmp.len) { r->cls = RC_OK; set_detail(r, "dump_%zu", dmp.len); break; }
 			r->cls = RC_OK; set_detail(r, "short_%d", (int)b.rx);
 			break;
 		}
@@ -277,6 +351,8 @@ void probe_fetch(const probe_opts *o, const struct sockaddr_storage *ss, socklen
 	}
 	r->ms = (int)(now_ms() - t1);
 	r->bytes = (int)b.rx;
+	if (dmp.len) { r->dump = dmp.p; dmp.p = NULL; }
+	free(dmp.p);
 out:
 	if (!r->ms) r->ms = (int)(now_ms() - t0);
 	if (!r->bytes) r->bytes = (int)b.rx;

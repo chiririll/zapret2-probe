@@ -26,6 +26,7 @@ typedef struct {
 	int dns_wait_ms;
 	int min_bytes;         /* fetch: stop when this many bytes came back on the connection */
 	const char *ca;        /* fetch: CA bundle file, default /etc/ssl/certs/ca-certificates.crt */
+	int dump;              /* fetch: keep the response headers and up to this many body bytes of the first response */
 } probe_opts;
 
 typedef struct {
@@ -37,6 +38,7 @@ typedef struct {
 	int hs_ms;             /* fetch: TLS handshake time */
 	char detail[48];
 	char info[256];        /* dns answers, space separated */
+	char *dump;            /* fetch --dump: headers, a blank line, the decoded body (ASCII only); malloc'd, freed by the caller */
 } presult;
 
 /* net.c */

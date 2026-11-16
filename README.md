@@ -8,7 +8,7 @@
 zprobe tls  --host example.com [--ip 1.2.3.4] [--mark 0x08000001] [--repeat 5] [--template FILE]
 zprobe quic --host example.com
 zprobe http --host example.com [--path /]
-zprobe fetch --host example.com [--ip A] [--path /] [--min-bytes 65536] [--ca FILE]   # needs mbedtls
+zprobe fetch --host example.com [--ip A] [--path /] [--min-bytes 65536] [--ca FILE] [--dump N]   # needs mbedtls
 zprobe dns  --host example.com [--server 1.1.1.1] [--ref 8.8.8.8] [--wait 300]
 zprobe batch [--parallel 4] [--pace-ms 200] < jobs.jsonl
 zprobe hello --host example.com > clienthello.bin
@@ -38,6 +38,9 @@ The top-level `class` is `ok` only if all repeats are ok, else the most frequent
 
 `fetch` reports `bytes`, `hs_ms` and the HTTP `status` (any status counts). A short page is requested again on the same
 connection until `--min-bytes`; if the server closes first the result is `ok` with detail `short_<bytes>` (inconclusive).
+`--dump N` (batch field `dump`) adds `dump` to the result: the status line and headers of the first response, a blank line,
+and up to N bytes of its body (chunked bodies decoded, bytes above 0x7e replaced by `?`, so it is plain ASCII). The fetch ends
+with the response (`ok`, detail `dump_<length>`) instead of reading to `--min-bytes`. It exists for the controller's "Add by URL".
 Expired certificates are ignored on purpose (router clocks are often wrong). The ClientHello comes from mbedtls, not from
 a browser template, so `fetch` complements `tls` and does not replace it.
 

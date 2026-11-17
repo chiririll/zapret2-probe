@@ -152,7 +152,7 @@ static void test_cli(void)
 	int port;
 	pid_t p = spawn_tcp(SRV_HELLO, &port);
 	char cmd[300], out[2048];
-	snprintf(cmd, sizeof cmd, "build/zprobe tls --host example.com --ip 127.0.0.1 --port %d --repeat 1", port);
+	snprintf(cmd, sizeof cmd, "" ZPROBE " tls --host example.com --ip 127.0.0.1 --port %d --repeat 1", port);
 	FILE *f = popen(cmd, "r");
 	size_t n = fread(out, 1, sizeof out - 1, f);
 	out[n] = 0;
@@ -160,7 +160,7 @@ static void test_cli(void)
 	CHECK(WEXITSTATUS(st) == 0 && strstr(out, "\"class\":\"ok\"") && strstr(out, "\"proto\":\"tls\""));
 	reap(p);
 	p = spawn_tcp(SRV_RST, &port);
-	snprintf(cmd, sizeof cmd, "build/zprobe tls --host example.com --ip 127.0.0.1 --port %d", port);
+	snprintf(cmd, sizeof cmd, "" ZPROBE " tls --host example.com --ip 127.0.0.1 --port %d", port);
 	f = popen(cmd, "r");
 	n = fread(out, 1, sizeof out - 1, f);
 	out[n] = 0;
@@ -173,7 +173,7 @@ static void test_cli(void)
 	snprintf(cmd, sizeof cmd,
 		 "printf '{\"id\":\"a\",\"cmd\":\"tls\",\"host\":\"x.org\",\"ip\":\"127.0.0.1\",\"port\":%d}\\n"
 		 "{\"id\":\"b\",\"cmd\":\"tls\",\"host\":\"y.org\",\"ip\":\"127.0.0.1\",\"port\":%d}\\n"
-		 "garbage\\n' | build/zprobe batch --parallel 2 2>/dev/null", p1, p2);
+		 "garbage\\n' | " ZPROBE " batch --parallel 2 2>/dev/null", p1, p2);
 	f = popen(cmd, "r");
 	n = fread(out, 1, sizeof out - 1, f);
 	out[n] = 0;
@@ -181,7 +181,7 @@ static void test_cli(void)
 	CHECK(strstr(out, "\"id\":\"a\"") && strstr(out, "\"id\":\"b\"") && strstr(out, "\"class\":\"alert\""));
 	CHECK(WEXITSTATUS(st) == 1);                /* bad line + failed probe */
 	reap(a); reap(b);
-	f = popen("build/zprobe bogus 2>/dev/null", "r");
+	f = popen("" ZPROBE " bogus 2>/dev/null", "r");
 	st = pclose(f);
 	CHECK(WEXITSTATUS(st) == 2);
 }

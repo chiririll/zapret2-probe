@@ -7,3 +7,17 @@ jobs:
       - uses: actions/checkout@v4
         with: { submodules: true }
       - run: make CFLAGS="-O2 -fsanitize=address,undefined -g" LDFLAGS="-fsanitize=address,undefined" test
+
+  lua:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { pkg: luajit, dev: libluajit-5.1-dev, bin: luajit }
+          - { pkg: lua5.3, dev: liblua5.3-dev, bin: lua5.3 }
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - run: sudo apt-get update && sudo apt-get install -y ${{ matrix.dev }} ${{ matrix.bin }} pkg-config
+      - run: make WITH_LUA=1 LUA_PKG=${{ matrix.pkg }} LUA_BIN=${{ matrix.bin }} CFLAGS="-O2 -fsanitize=address,undefined -g" LDFLAGS="-fsanitize=address,undefined" test

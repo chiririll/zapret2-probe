@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include "check.h"
 #include "../src/common.h"
+#include "../src/check.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -36,7 +37,7 @@ static const char KEY_PEM[] =
 	"-----END PRIVATE KEY-----\n";
 
 /* what the server does once the TLS handshake is done */
-enum { SRV_BIG, SRV_STALL_AT, SRV_SMALL_CLOSE, SRV_SMALL_KEEPALIVE, SRV_CHUNKED_KEEPALIVE, SRV_HS_RST, SRV_SILENT, SRV_DUMP_PLAIN, SRV_DUMP_CHUNKED };
+enum { SRV_BIG, SRV_STALL_AT, SRV_SMALL_CLOSE, SRV_SMALL_KEEPALIVE, SRV_CHUNKED_KEEPALIVE, SRV_HS_RST, SRV_SILENT, SRV_DUMP_PLAIN, SRV_DUMP_CHUNKED, SRV_ECHO, SRV_REDIRECT, SRV_HEADERS_STALL, SRV_CHUNKED_ONE };
 
 static int sock_send(void *c, const unsigned char *b, size_t l) { ssize_t n = send(*(int *)c, b, l, MSG_NOSIGNAL); return n < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : (int)n; }
 static int sock_recv(void *c, unsigned char *b, size_t l) { ssize_t n = recv(*(int *)c, b, l, 0); return n < 0 ? MBEDTLS_ERR_NET_RECV_FAILED : (int)n; }
@@ -116,6 +117,46 @@ static void server(int ls, int mode)
 		srv_write(&ssl, m, sizeof m - 1);
 		break;
 	}
+	case SRV_ECHO: {
+		/* the request, headers and body, comes back as the body of a 200 */
+		char all[4096];
+		size_t n = 0;
+		for (;;) {
+			k = mbedtls_ssl_read(&ssl, (unsigned char *)all + n, sizeof all - n - 1);
+			if (k <= 0) break;
+			n += k;
+			all[n] = 0;
+			char *he = strstr(all, "\r\n\r\n"), *cl = strstr(all, "Content-Length: ");
+			size_t want = cl ? (size_t)atoi(cl + 16) : 0;
+			if (he && n >= (size_t)(he - all) + 4 + want) break;
+		}
+		char hdr[128];
+		snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nX-Foo: a\r\nx-foo: b\r\nContent-Length: %zu\r\n\r\n", n);
+		srv_write(&ssl, hdr, strlen(hdr));
+		srv_write(&ssl, all, n);
+		break;
+	}
+	case SRV_REDIRECT: {
+		static const char m[] = "HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\n\r\n";
+		k = mbedtls_ssl_read(&ssl, (unsigned char *)req, sizeof req); (void)k;
+		srv_write(&ssl, m, sizeof m - 1);
+		sleep(1);
+		break;
+	}
+	case SRV_HEADERS_STALL: {
+		static const char m[] = "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nServer: t\r\n\r\n";
+		k = mbedtls_ssl_read(&ssl, (unsigned char *)req, sizeof req); (void)k;
+		srv_write(&ssl, m, sizeof m - 1);
+		sleep(5);
+		break;
+	}
+	case SRV_CHUNKED_ONE: {
+		static const char m[] = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+		k = mbedtls_ssl_read(&ssl, (unsigned char *)req, sizeof req); (void)k;
+		srv_write(&ssl, m, sizeof m - 1);
+		sleep(5);          /* keep-alive: only the framing tells the response is over */
+		break;
+	}
 	case SRV_CHUNKED_KEEPALIVE:
 		for (;;) {
 			k = mbedtls_ssl_read(&ssl, (unsigned char *)req, sizeof req);
@@ -167,6 +208,81 @@ static void run(int mode, const char *host, int min_bytes, int timeout, const ch
 	probe_fetch(&o, (struct sockaddr_storage *)&a, sizeof a, r);
 	kill(p, SIGKILL); waitpid(p, NULL, 0);
 }
+
+/* the Lua-facing mode: one request as given, raw response back */
+static void run_once(int mode, probe_opts o, presult *r, const char *ca)
+{
+	int port;
+	pid_t p = spawn(mode, &port);
+	struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+	o.host = "localhost"; o.timeout_ms = o.timeout_ms ? o.timeout_ms : 2000; o.ca = ca; o.once = true; o.repeat = 1;
+	probe_fetch(&o, (struct sockaddr_storage *)&a, sizeof a, r);
+	kill(p, SIGKILL); waitpid(p, NULL, 0);
+}
+
+static void free_r(presult *r) { free(r->rhdr); free(r->rbody); free(r->dump); }
+
+#ifdef WITH_LUA
+static void lua_fetch_tests(const char *ca)
+{
+	char dir[] = "/tmp/zprobe-test-lua-XXXXXX";
+	if (!mkdtemp(dir)) return;
+	char path[300];
+	snprintf(path, sizeof path, "%s/tf.lua", dir);
+	FILE *f = fopen(path, "w");
+	fputs("local json = require 'json'\n"
+	      "return { protos = {'tls'}, args = { port = { type = 'number', required = true }, mode = { default = 'echo' } },\n"
+	      " check = function(p, a)\n"
+	      "  local url = 'https://localhost:' .. a.port .. '/p?x=1'\n"
+	      "  if a.mode == 'echo' then\n"
+	      "    local r = p:fetch{ url = url, ip = '127.0.0.1', method = 'POST', headers = { ['X-Test'] = 'yes', Range = 'bytes=0-9' }, body = json.encode({ a = 1 }) }\n"
+	      "    p:report('status', r.status); p:report('x', r.headers['x-foo']); p:report('body', r.body); p:report('bytes', r.bytes)\n"
+	      "    return p:ok(r.detail)\n"
+	      "  elseif a.mode == 'redirect' then\n"
+	      "    local r = p:fetch{ url = url, ip = '127.0.0.1', max_body = 0 }\n"
+	      "    p:report('loc', r.headers.location); return p:ok(tostring(r.status))\n"
+	      "  elseif a.mode == 'headers' then\n"
+	      "    local r = p:fetch{ url = url, ip = '127.0.0.1', stop = 'headers' }\n"
+	      "    return p:ok(r.detail .. ':' .. tostring(r.headers.server))\n"
+	      "  else\n"
+	      "    local r = p:fetch{ url = url, ip = '127.0.0.1', headers = { ['Bad'] = 'a\\r\\nb: c' } }\n"
+	      "    return p:ok('unreachable')\n"
+	      "  end\n"
+	      " end }\n", f);
+	fclose(f);
+	check_add_dir(dir);
+	check_add_dir("checks");
+	int port;
+	for (int i = 0; i < 4; i++) {
+		static const int modes[] = { SRV_ECHO, SRV_REDIRECT, SRV_HEADERS_STALL, SRV_ECHO };
+		static const char *const names[] = { "echo", "redirect", "headers", "bad" };
+		pid_t pid = spawn(modes[i], &port);
+		char args[200];
+		snprintf(args, sizeof args, "{\"port\":%d,\"mode\":\"%s\"}", port, names[i]);
+		probe_opts o = { .timeout_ms = 2000, .repeat = 1, .ca = ca };
+		sbuf out;
+		sb_init(&out);
+		run_check("t", &o, "tf", "check", args, &out);
+		kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+		if (i == 0) {
+			CHECK(strstr(out.p, "\"class\":\"ok\"") && strstr(out.p, "\"status\":200"));
+			CHECK(strstr(out.p, "POST /p?x=1 HTTP/1.1") && strstr(out.p, "X-Test: yes") && strstr(out.p, "Range: bytes=0-9"));
+			CHECK(strstr(out.p, "Content-Length: 7") && strstr(out.p, "{\\\"a\\\":1}"));
+			CHECK(strstr(out.p, "\"x\":\"a, b\""));            /* repeated headers are joined */
+			CHECK(strstr(out.p, "\"p\":\"fetch\"") && strstr(out.p, "\"ip\":\"127.0.0.1\""));
+		} else if (i == 1) {
+			CHECK(strstr(out.p, "\"detail\":\"302\"") && strstr(out.p, "\"loc\":\"/elsewhere\""));
+		} else if (i == 2) {
+			CHECK(strstr(out.p, "\"detail\":\"headers:t\""));
+		} else {
+			CHECK(strstr(out.p, "script_error") && strstr(out.p, "bad_header"));
+		}
+		sb_free(&out);
+	}
+	unlink(path);
+	rmdir(dir);
+}
+#endif
 
 int main(void)
 {
@@ -221,6 +337,62 @@ int main(void)
 	CHECK(r.cls == RC_OK && r.dump && strstr(r.dump, "Content-Security-Policy: img-src cdn.example.net") && strstr(r.dump, "<a href=\""));
 	CHECK(r.dump && !strstr(r.dump, "a.example.org"));
 	free(r.dump);
+
+	/* once: what the Lua primitive uses */
+	{
+		probe_opts o = { .method = "POST", .hdrs = "X-Test: 1\r\n", .body = (const uint8_t *)"abc", .body_len = 3, .max_body = 10000 };
+		run_once(SRV_ECHO, o, &r, ca);
+		CHECK(r.cls == RC_OK && r.status == 200 && r.rhdr && !strncmp(r.rhdr, "HTTP/1.1 200", 12) && r.rhdr_len > 20);
+		CHECK(r.rbody && strstr(r.rbody, "POST / HTTP/1.1") && strstr(r.rbody, "X-Test: 1") && strstr(r.rbody, "Content-Length: 3") && r.rbody_len == strlen(r.rbody));
+		CHECK(!strncmp(r.detail, "complete_", 9));
+		free_r(&r);
+		/* a User-Agent of ours replaces the default */
+		o = (probe_opts){ .hdrs = "User-Agent: zz\r\n", .max_body = 10000 };
+		run_once(SRV_ECHO, o, &r, ca);
+		CHECK(r.rbody && strstr(r.rbody, "User-Agent: zz") && !strstr(r.rbody, "Mozilla"));
+		free_r(&r);
+		/* a 300 KB body: keep 1000 bytes, count the rest, finish when the response ends */
+		o = (probe_opts){ .max_body = 1000 };
+		run_once(SRV_BIG, o, &r, ca);
+		CHECK(r.cls == RC_OK && r.rbody_len == 1000 && r.bytes > 300000 && !strncmp(r.detail, "complete_", 9));
+		free_r(&r);
+		/* min_bytes stops the download early */
+		o = (probe_opts){ .max_body = 100, .min_bytes = 65536 };
+		run_once(SRV_BIG, o, &r, ca);
+		CHECK(r.cls == RC_OK && r.bytes >= 65536 && r.bytes < 300000 && !strncmp(r.detail, "bytes_", 6) && r.rbody_len == 100);
+		free_r(&r);
+		/* the freeze after 20 KB is still a stall */
+		o = (probe_opts){ .max_body = 100, .timeout_ms = 600 };
+		run_once(SRV_STALL_AT, o, &r, ca);
+		CHECK(r.cls == RC_STALLED && r.bytes > 15000 && r.bytes < 40000);
+		free_r(&r);
+		/* chunked body decoded, keep-alive connection left open */
+		o = (probe_opts){ .max_body = 100 };
+		run_once(SRV_CHUNKED_ONE, o, &r, ca);
+		CHECK(r.cls == RC_OK && r.rbody && !strcmp(r.rbody, "hello world") && !strncmp(r.detail, "complete_", 9));
+		free_r(&r);
+		/* stop at the end of the headers */
+		o = (probe_opts){ .stop_headers = true };
+		run_once(SRV_HEADERS_STALL, o, &r, ca);
+		CHECK(r.cls == RC_OK && !strcmp(r.detail, "headers") && r.rhdr && strstr(r.rhdr, "Server: t") && r.rbody_len == 0 && r.status == 200);
+		free_r(&r);
+		/* HEAD: no body to wait for */
+		o = (probe_opts){ .method = "HEAD", .max_body = 10 };
+		run_once(SRV_HEADERS_STALL, o, &r, ca);
+		CHECK(r.cls == RC_OK && !strncmp(r.detail, "complete_", 9));
+		free_r(&r);
+		/* a request line longer than the old 1 KB limit */
+		char longp[3000];
+		memset(longp, 'a', sizeof longp - 1);
+		longp[0] = '/'; longp[sizeof longp - 1] = 0;
+		o = (probe_opts){ .path = longp, .max_body = 5000 };
+		run_once(SRV_ECHO, o, &r, ca);
+		CHECK(r.cls == RC_OK && r.rbody && strstr(r.rbody, "aaaaaaaa HTTP/1.1"));
+		free_r(&r);
+	}
+#ifdef WITH_LUA
+	lua_fetch_tests(ca);
+#endif
 
 	unlink(ca);
 	DONE();

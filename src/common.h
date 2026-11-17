@@ -5,7 +5,7 @@
 #include <sys/socket.h>
 
 typedef enum {
-	RC_OK, RC_RST, RC_TIMEOUT, RC_ALERT, RC_FORGED, RC_DNS_SPOOFED, RC_UNREACHABLE, RC_ERROR, RC_STALLED, RC_COUNT
+	RC_OK, RC_RST, RC_TIMEOUT, RC_ALERT, RC_FORGED, RC_DNS_SPOOFED, RC_UNREACHABLE, RC_ERROR, RC_STALLED, RC_INCONCLUSIVE, RC_COUNT
 } result_class;
 
 const char *class_name(result_class c);
@@ -27,6 +27,14 @@ typedef struct {
 	int min_bytes;         /* fetch: stop when this many bytes came back on the connection */
 	const char *ca;        /* fetch: CA bundle file, default /etc/ssl/certs/ca-certificates.crt */
 	int dump;              /* fetch: keep the response headers and up to this many body bytes of the first response */
+	/* fetch, used by the Lua primitives: one request, the raw response is returned in presult.rhdr / rbody */
+	bool once;             /* send one request as given (no repeating of short pages), capture headers and body */
+	const char *method;    /* default GET */
+	const char *hdrs;      /* extra request headers, "Name: value\r\n" each; replaces the default User-Agent/Accept if present */
+	const uint8_t *body;   /* request body */
+	size_t body_len;
+	size_t max_body;       /* once: response body bytes kept (counting continues past it) */
+	bool stop_headers;     /* once: finish when the response headers are complete */
 } probe_opts;
 
 typedef struct {
@@ -39,6 +47,8 @@ typedef struct {
 	char detail[48];
 	char info[256];        /* dns answers, space separated */
 	char *dump;            /* fetch --dump: headers, a blank line, the decoded body (ASCII only); malloc'd, freed by the caller */
+	char *rhdr, *rbody;    /* fetch once: response header block (with the final blank line) and decoded body; malloc'd */
+	size_t rhdr_len, rbody_len;
 } presult;
 
 /* net.c */

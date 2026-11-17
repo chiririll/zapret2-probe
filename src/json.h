@@ -12,3 +12,6 @@ typedef struct { char key[32]; char val[512]; } kv;
 /* flat object only: {"k":"v","n":5,"b":true}; returns count or -1 */
 int json_parse_flat(const char *s, kv *out, int max);
 const char *kv_get(const kv *a, int n, const char *key);
+const char *json_skip_value(const char *s);
+/* raw JSON text of a member of the top-level object, malloc'd, or NULL */
+char *json_raw_field(const char *s, const char *key);

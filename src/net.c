@@ -13,7 +13,7 @@
 #include "common.h"
 
 static const char *const names[RC_COUNT] = {
-	"ok", "rst", "timeout", "alert", "forged", "dns_spoofed", "unreachable", "error", "stalled"
+	"ok", "rst", "timeout", "alert", "forged", "dns_spoofed", "unreachable", "error", "stalled", "inconclusive"
 };
 const char *class_name(result_class c) { return c < RC_COUNT ? names[c] : "error"; }
 

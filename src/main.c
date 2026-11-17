@@ -10,12 +10,13 @@
 #include <unistd.h>
 #include "common.h"
 #include "json.h"
+#include "check.h"
 
-#define VERSION "0.1.0"
+#define VERSION "0.2.0"
 
 static void usage(FILE *f)
 {
-	fputs("usage: zprobe <tls|quic|http|fetch|dns|batch|hello> [options]\n"
+	fputs("usage: zprobe <tls|quic|http|fetch|dns|check|check-info|batch|hello> [options]\n"
 	      "  --host NAME        SNI / Host header / name to resolve\n"
 	      "  --ip ADDR          connect here instead of resolving --host\n"
 	      "  --port N           default 443 (tls, quic), 80 (http)\n"
@@ -32,6 +33,11 @@ static void usage(FILE *f)
 	      "  --server IP        dns: resolver (default: first in /etc/resolv.conf)\n"
 	      "  --ref IP           dns: second resolver for comparison\n"
 	      "  --wait MS          dns: wait for extra replies after the first (injection check), default 300\n"
+	      "  --check NAME       check: run the Lua script NAME.lua (from --checks) with the other options\n"
+	      "  --arg K=V          check: argument for the script, repeatable (proto=tls, stage=screen are always accepted)\n"
+	      "  --phase prepare    check: call the script's prepare instead of check\n"
+	      "  --checks DIR       directory with check scripts, repeatable, first match wins (default: " CHECK_DIRS ")\n"
+	      "  --max-body N       check: response body bytes a fetch keeps for the script, default 262144\n"
 	      "  -4 / -6            address family\n"
 	      "  --parallel N       batch: concurrent jobs, default 1\n"
 	      "  --json             accepted for compatibility; output is always JSON\n"
@@ -160,36 +166,46 @@ static int cmd_batch(const probe_opts *base, int parallel, int pace_ms)
 		int n = json_parse_flat(t, a, 24);
 		if (n < 0) { fprintf(stderr, "zprobe: batch line %d: invalid JSON\n", lineno); failed++; continue; }
 		probe_opts o = *base;
-		char host[256], ip[64], path[256], server[64], ref[64], tpl[256], ca[256], cmd[16], id[64];
+		char host[256], ip[64], path[256], server[64], ref[64], tpl[256], ca[256], cmd[16], id[64], chk[80], phase[16];
 		const char *v;
 #define STR(key, dst, field) do { if ((v = kv_get(a, n, key))) { snprintf(dst, sizeof dst, "%s", v); o.field = dst; } } while (0)
 #define NUM(key, field) do { if ((v = kv_get(a, n, key))) o.field = atoi(v); } while (0)
 		STR("host", host, host); STR("ip", ip, ip); STR("path", path, path);
 		STR("server", server, server); STR("ref", ref, ref); STR("template", tpl, template_path); STR("ca", ca, ca);
 		NUM("port", port); NUM("timeout", timeout_ms); NUM("repeat", repeat); NUM("family", family);
-		NUM("pace_ms", pace_ms); NUM("min_bytes", min_bytes); NUM("dump", dump);
+		NUM("pace_ms", pace_ms); NUM("min_bytes", min_bytes); NUM("dump", dump); NUM("max_body", max_body);
 		if ((v = kv_get(a, n, "mark"))) o.mark = parse_mark(v);
 		snprintf(cmd, sizeof cmd, "%s", (v = kv_get(a, n, "cmd")) ? v : "tls");
 		snprintf(id, sizeof id, "%s", (v = kv_get(a, n, "id")) ? v : "");
-		if (strcmp(cmd, "tls") && strcmp(cmd, "quic") && strcmp(cmd, "http") && strcmp(cmd, "fetch") && strcmp(cmd, "dns")) {
+		snprintf(chk, sizeof chk, "%s", (v = kv_get(a, n, "check")) ? v : "generic");
+		snprintf(phase, sizeof phase, "%s", (v = kv_get(a, n, "phase")) ? v : "check");
+		bool is_check = !strcmp(cmd, "check");
+		if (strcmp(cmd, "tls") && strcmp(cmd, "quic") && strcmp(cmd, "http") && strcmp(cmd, "fetch") && strcmp(cmd, "dns") && !is_check) {
 			fprintf(stderr, "zprobe: batch line %d: unknown cmd '%s'\n", lineno, cmd);
 			failed++;
 			continue;
 		}
 		while (running >= parallel) { int st; if (wait(&st) > 0) { running--; } else break; }
 		fflush(stdout);
-		pid_t pid = parallel > 1 ? fork() : 0;
+		/* a check script runs in its own process even with --parallel 1: it has an alarm() and a Lua state to throw away */
+		bool forked = parallel > 1 || is_check;
+		pid_t pid = forked ? fork() : 0;
 		if (pid == 0) {
 			sbuf out;
 			sb_init(&out);
-			int bad = run_job(cmd, &o, id[0] ? id : NULL, &out);
+			int bad;
+			if (is_check) {
+				char *args = json_raw_field(t, "args");
+				bad = run_check(id[0] ? id : NULL, &o, chk, phase, args, &out);
+				free(args);
+			} else bad = run_job(cmd, &o, id[0] ? id : NULL, &out);
 			sb_puts(&out, "\n");
 			if (bad >= 0) {
-				if (parallel > 1) { ssize_t w = write(1, out.p, out.len); (void)w; }
+				if (forked) { ssize_t w = write(1, out.p, out.len); (void)w; }
 				else fwrite(out.p, 1, out.len, stdout);
 			}
 			sb_free(&out);
-			if (parallel > 1) _exit(bad != 0);
+			if (forked) _exit(bad != 0);
 			if (bad) failed++;
 		} else if (pid > 0) running++;
 		else { perror("fork"); failed++; }
@@ -208,13 +224,16 @@ int main(int argc, char **argv)
 {
 	probe_opts o;
 	int parallel = 1;
-	const char *user = NULL;
+	const char *user = NULL, *check = "generic", *phase = "check";
+	const char *cargs[32];
+	int ncargs = 0;
 	static const struct option lo[] = {
 		{ "host", 1, 0, 'H' }, { "ip", 1, 0, 'i' }, { "port", 1, 0, 'p' }, { "mark", 1, 0, 'm' },
 		{ "timeout", 1, 0, 't' }, { "repeat", 1, 0, 'r' }, { "pace-ms", 1, 0, 'P' },
 		{ "template", 1, 0, 'T' }, { "path", 1, 0, 'a' }, { "server", 1, 0, 's' }, { "ref", 1, 0, 'R' },
 		{ "wait", 1, 0, 'w' }, { "parallel", 1, 0, 'j' }, { "json", 0, 0, 'J' }, { "help", 0, 0, 'h' },
-		{ "version", 0, 0, 'V' }, { "user", 1, 0, 'u' }, { "min-bytes", 1, 0, 'b' }, { "ca", 1, 0, 'c' }, { "dump", 1, 0, 'd' }, { 0 }
+		{ "version", 0, 0, 'V' }, { "user", 1, 0, 'u' }, { "min-bytes", 1, 0, 'b' }, { "ca", 1, 0, 'c' }, { "dump", 1, 0, 'd' },
+		{ "check", 1, 0, 'k' }, { "arg", 1, 0, 'A' }, { "phase", 1, 0, 'F' }, { "checks", 1, 0, 'C' }, { "max-body", 1, 0, 'B' }, { 0 }
 	};
 	opts_default(&o);
 	signal(SIGPIPE, SIG_IGN);
@@ -245,6 +264,14 @@ int main(int argc, char **argv)
 		case 'b': o.min_bytes = atoi(optarg); break;
 		case 'c': o.ca = optarg; break;
 		case 'd': o.dump = atoi(optarg); break;
+		case 'k': check = optarg; break;
+		case 'F': phase = optarg; break;
+		case 'C': check_add_dir(optarg); break;
+		case 'B': o.max_body = (size_t)atol(optarg); break;
+		case 'A':
+			if (ncargs < 32 && strchr(optarg, '=')) cargs[ncargs++] = optarg;
+			else { fputs("zprobe: --arg needs K=V (at most 32)\n", stderr); return 2; }
+			break;
 		case 'J': break;
 		case 'h': usage(stdout); return 0;
 		case 'V': puts("zprobe " VERSION); return 0;
@@ -256,6 +283,31 @@ int main(int argc, char **argv)
 	if (user && priv_drop(user, o.mark || !strcmp(cmd, "batch"))) return 2;
 	if (!strcmp(cmd, "batch")) return cmd_batch(&o, parallel, o.pace_ms);
 	if (!strcmp(cmd, "hello")) return cmd_hello(&o);
+	if (!strcmp(cmd, "check-info")) {
+		sbuf out;
+		sb_init(&out);
+		check_info(&out);
+		puts(out.p);
+		sb_free(&out);
+		return 0;
+	}
+	if (!strcmp(cmd, "check")) {
+		sbuf args, out;
+		sb_init(&args); sb_init(&out);
+		sb_puts(&args, "{");
+		for (int i = 0; i < ncargs; i++) {
+			const char *eq = strchr(cargs[i], '=');
+			char key[64];
+			snprintf(key, sizeof key, "%.*s", (int)(eq - cargs[i] > 63 ? 63 : eq - cargs[i]), cargs[i]);
+			if (i) sb_puts(&args, ",");
+			sb_jstr(&args, key); sb_puts(&args, ":"); sb_jstr(&args, eq + 1);
+		}
+		sb_puts(&args, "}");
+		int bad = run_check(NULL, &o, check, phase, args.p, &out);
+		puts(out.p);
+		sb_free(&args); sb_free(&out);
+		return bad ? 1 : 0;
+	}
 	if (strcmp(cmd, "tls") && strcmp(cmd, "quic") && strcmp(cmd, "http") && strcmp(cmd, "fetch") && strcmp(cmd, "dns")) {
 		fprintf(stderr, "zprobe: unknown command '%s'\n", cmd);
 		usage(stderr);

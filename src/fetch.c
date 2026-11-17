@@ -152,6 +152,9 @@ typedef struct {
 	char *p;
 	size_t len, cap, body, max;
 	bool hdone, chunked, done;
+	bool raw;                /* keep bytes as they are (Lua fetch) instead of ASCII-only */
+	bool keep;               /* at max stop storing but do not end the capture */
+	size_t hend;             /* length of the header block */
 	int cs;                  /* chunk state: 0 size line, 1 data, 2 CR LF after data, 3 trailer/end */
 	size_t left;
 	char line[24];
@@ -166,7 +169,7 @@ static void dump_put(dump_t *d, unsigned char c)
 		if (!np) { d->done = true; return; }
 		d->p = np; d->cap = nc;
 	}
-	d->p[d->len++] = c >= 0x20 && c < 0x7f ? c : (c == '\n' || c == '\r' || c == '\t' ? c : '?');
+	d->p[d->len++] = d->raw || (c >= 0x20 && c < 0x7f) ? c : (c == '\n' || c == '\r' || c == '\t' ? c : '?');
 	d->p[d->len] = 0;
 }
 
@@ -175,8 +178,10 @@ static void dump_feed(dump_t *d, const uint8_t *b, size_t n)
 	for (size_t i = 0; i < n && !d->done; i++) {
 		if (!d->hdone) {
 			dump_put(d, b[i]);
+			if (d->len > 65536) { d->done = true; break; }
 			if (d->len >= 4 && !memcmp(d->p + d->len - 4, "\r\n\r\n", 4)) {
 				d->hdone = true;
+				d->hend = d->len;
 				d->chunked = false;
 				for (char *l = d->p; l && *l; ) {
 					if (!strncasecmp(l, "transfer-encoding:", 18) && strcasestr(l, "chunked") &&
@@ -188,7 +193,7 @@ static void dump_feed(dump_t *d, const uint8_t *b, size_t n)
 			continue;
 		}
 		if (!d->chunked) {
-			if (d->body >= d->max) { d->done = true; break; }
+			if (d->body >= d->max) { if (d->keep) continue; d->done = true; break; }
 			dump_put(d, b[i]); d->body++;
 			continue;
 		}
@@ -202,8 +207,8 @@ static void dump_feed(dump_t *d, const uint8_t *b, size_t n)
 			} else if (d->ll + 1 < sizeof d->line) d->line[d->ll++] = b[i];
 			break;
 		case 1:
-			if (d->body >= d->max) { d->done = true; break; }
-			dump_put(d, b[i]); d->body++;
+			if (d->body >= d->max) { if (!d->keep) { d->done = true; break; } }
+			else { dump_put(d, b[i]); d->body++; }
 			if (--d->left == 0) d->cs = 2;
 			break;
 		case 2:
@@ -291,33 +296,51 @@ void probe_fetch(const probe_opts *o, const struct sockaddr_storage *ss, socklen
 	if (vf & MBEDTLS_X509_BADCERT_CN_MISMATCH) { r->cls = RC_FORGED; set_detail(r, "cert_name"); goto out; }
 	if (g_ca_loaded && (vf & MBEDTLS_X509_BADCERT_NOT_TRUSTED)) { r->cls = RC_FORGED; set_detail(r, "cert_untrusted"); goto out; }
 
-	char req[1024];
-	int rl = snprintf(req, sizeof req,
-			  "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n"
-			  "Accept-Encoding: identity\r\nConnection: keep-alive\r\n\r\n",
-			  o->path ? o->path : "/", o->host);
-	if (rl <= 0 || (size_t)rl >= sizeof req) { r->cls = RC_ERROR; set_detail(r, "request_too_long"); goto out; }
+	const char *method = o->method ? o->method : "GET";
+	bool head = !strcmp(method, "HEAD");
+	bool ua = o->hdrs && (strcasestr(o->hdrs, "user-agent:") != NULL), acc = o->hdrs && (strcasestr(o->hdrs, "accept:") != NULL);
+	size_t cap_req = 512 + strlen(o->path ? o->path : "/") + strlen(o->host) + (o->hdrs ? strlen(o->hdrs) : 0) + o->body_len;
+	char *req = malloc(cap_req);
+	if (!req) { r->cls = RC_ERROR; set_detail(r, "oom"); goto out; }
+	int rl = snprintf(req, cap_req, "%s %s HTTP/1.1\r\nHost: %s\r\n%s%sAccept-Encoding: identity\r\nConnection: keep-alive\r\n",
+			  method, o->path ? o->path : "/", o->host,
+			  ua ? "" : "User-Agent: Mozilla/5.0\r\n", acc ? "" : "Accept: */*\r\n");
+	if (o->hdrs) rl += snprintf(req + rl, cap_req - rl, "%s", o->hdrs);
+	if (o->body_len) rl += snprintf(req + rl, cap_req - rl, "Content-Length: %zu\r\n", o->body_len);
+	rl += snprintf(req + rl, cap_req - rl, "\r\n");
+	if (o->body_len) { memcpy(req + rl, o->body, o->body_len); rl += o->body_len; }
 
+	bool cap = o->once;      /* Lua fetch: send once, keep the raw response, see the cases below */
 	int64_t t1 = now_ms();
 	resp_t resp;
 	resp_reset(&resp);
 	int nreq = 1;
-	dump_t dmp = { .max = o->dump > 0 ? (size_t)o->dump : 0 };
+	dump_t dmp = { .max = cap ? o->max_body : (o->dump > 0 ? (size_t)o->dump : 0), .raw = cap, .keep = cap };
 	if ((ret = write_all(&ssl, &b, req, rl, t1 + o->timeout_ms)) != 0) {
 		if (ret == MBEDTLS_ERR_SSL_TIMEOUT) { r->cls = RC_STALLED; set_detail(r, "send_stall"); }
 		else tls_fail_class(ret, &b, r, "send");
 		r->bytes = (int)b.rx;
+		free(req);
 		goto out;
 	}
 	uint8_t buf[IO_CHUNK];
 	dl = now_ms() + o->timeout_ms;        /* inactivity limit, moved on every byte */
 	for (;;) {
-		if (!dmp.max && (int64_t)b.rx >= min_bytes) { r->cls = RC_OK; set_detail(r, "bytes_%d", (int)b.rx); break; }
+		if (cap ? (o->min_bytes > 0 && (int64_t)b.rx >= o->min_bytes) : (!dmp.max && (int64_t)b.rx >= min_bytes)) {
+			r->cls = RC_OK; set_detail(r, "bytes_%d", (int)b.rx); break;
+		}
 		ret = mbedtls_ssl_read(&ssl, buf, sizeof buf);
 		if (ret > 0) {
 			dl = now_ms() + o->timeout_ms;
 			bool done = resp_feed(&resp, buf, ret);
 			if (resp.status && !r->status) r->status = resp.status;
+			if (cap) {
+				dump_feed(&dmp, buf, ret);
+				if (dmp.hdone && o->stop_headers) { r->cls = RC_OK; set_detail(r, "headers"); break; }
+				if (dmp.hdone && (head || resp.status == 204 || resp.status == 304 || resp.status / 100 == 1)) done = true;
+				if (done || dmp.done) { r->cls = RC_OK; set_detail(r, "complete_%d", (int)b.rx); break; }
+				continue;
+			}
 			if (dmp.max && nreq == 1) {
 				dump_feed(&dmp, buf, ret);
 				if (done || dmp.done) { r->cls = RC_OK; set_detail(r, "dump_%zu", dmp.len); break; }
@@ -342,6 +365,11 @@ void probe_fetch(const probe_opts *o, const struct sockaddr_storage *ss, socklen
 		if (ret == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) continue;
 		if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
 			/* the server finished first: the page was smaller than min-bytes, inconclusive for the controller */
+			if (cap) {
+				if (!dmp.hdone) { r->cls = RC_RST; set_detail(r, "eof_no_response"); break; }
+				r->cls = RC_OK; set_detail(r, "complete_%d", (int)b.rx);
+				break;
+			}
 			if (dmp.max && dmp.len) { r->cls = RC_OK; set_detail(r, "dump_%zu", dmp.len); break; }
 			r->cls = RC_OK; set_detail(r, "short_%d", (int)b.rx);
 			break;
@@ -351,7 +379,16 @@ void probe_fetch(const probe_opts *o, const struct sockaddr_storage *ss, socklen
 	}
 	r->ms = (int)(now_ms() - t1);
 	r->bytes = (int)b.rx;
-	if (dmp.len) { r->dump = dmp.p; dmp.p = NULL; }
+	free(req);
+	if (cap && dmp.len) {
+		size_t hl = dmp.hdone ? dmp.hend : dmp.len;
+		r->rhdr = malloc(hl + 1);
+		r->rbody = malloc(dmp.len - hl + 1);
+		if (r->rhdr && r->rbody) {
+			memcpy(r->rhdr, dmp.p, hl); r->rhdr[hl] = 0; r->rhdr_len = hl;
+			memcpy(r->rbody, dmp.p + hl, dmp.len - hl); r->rbody[dmp.len - hl] = 0; r->rbody_len = dmp.len - hl;
+		} else { free(r->rhdr); free(r->rbody); r->rhdr = r->rbody = NULL; r->rhdr_len = r->rbody_len = 0; }
+	} else if (dmp.len) { r->dump = dmp.p; dmp.p = NULL; }
 	free(dmp.p);
 out:
 	if (!r->ms) r->ms = (int)(now_ms() - t0);

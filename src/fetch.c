@@ -299,12 +299,13 @@ void probe_fetch(const probe_opts *o, const struct sockaddr_storage *ss, socklen
 	const char *method = o->method ? o->method : "GET";
 	bool head = !strcmp(method, "HEAD");
 	bool ua = o->hdrs && (strcasestr(o->hdrs, "user-agent:") != NULL), acc = o->hdrs && (strcasestr(o->hdrs, "accept:") != NULL);
+	bool conn = o->hdrs && (strcasestr(o->hdrs, "\nconnection:") != NULL || !strncasecmp(o->hdrs, "connection:", 11));
 	size_t cap_req = 512 + strlen(o->path ? o->path : "/") + strlen(o->host) + (o->hdrs ? strlen(o->hdrs) : 0) + o->body_len;
 	char *req = malloc(cap_req);
 	if (!req) { r->cls = RC_ERROR; set_detail(r, "oom"); goto out; }
-	int rl = snprintf(req, cap_req, "%s %s HTTP/1.1\r\nHost: %s\r\n%s%sAccept-Encoding: identity\r\nConnection: keep-alive\r\n",
+	int rl = snprintf(req, cap_req, "%s %s HTTP/1.1\r\nHost: %s\r\n%s%sAccept-Encoding: identity\r\n%s",
 			  method, o->path ? o->path : "/", o->host,
-			  ua ? "" : "User-Agent: Mozilla/5.0\r\n", acc ? "" : "Accept: */*\r\n");
+			  ua ? "" : "User-Agent: Mozilla/5.0\r\n", acc ? "" : "Accept: */*\r\n", conn ? "" : "Connection: keep-alive\r\n");
 	if (o->hdrs) rl += snprintf(req + rl, cap_req - rl, "%s", o->hdrs);
 	if (o->body_len) rl += snprintf(req + rl, cap_req - rl, "Content-Length: %zu\r\n", o->body_len);
 	rl += snprintf(req + rl, cap_req - rl, "\r\n");
